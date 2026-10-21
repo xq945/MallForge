@@ -50,7 +50,7 @@ spring:
   data:
     redis:
       database: 0
-      port: 6379
+      port: 6380
       host: localhost
       password:
 secure:

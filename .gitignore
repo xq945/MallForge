@@ -31,3 +31,15 @@ Thumbs.db
 coverage/
 .eslintcache
 .nyc_output/
+
+# 本地中间件插件（体积大，用 scripts/setup-es-ik.sh 重新下载）
+docker/elasticsearch/
+
+# 本地敏感配置（含 OSS AccessKey 等，禁止提交）
+**/*.local.yaml
+**/*.local.yml
+.env.local
+
+# 临时排查用的 Sa-Token 源码快照
+.tmp-satoken/
+.tmp-satoken-core/
