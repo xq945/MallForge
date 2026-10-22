@@ -37,4 +37,29 @@ public interface PortalOrderDao {
      */
     int releaseSkuStockLock(@Param("itemList") List<OmsOrderItem> orderItemList);
 
+    /**
+     * 条件锁定库存：仅在可售库存足够时加锁，返回 0 表示库存不足。
+     */
+    int lockSkuStock(@Param("skuId") Long skuId, @Param("quantity") Integer quantity);
+
+    /**
+     * 条件支付扣减：同时扣减 stock 与 lock_stock，并累加销量。
+     */
+    int paySkuStock(@Param("skuId") Long skuId, @Param("quantity") Integer quantity);
+
+    /**
+     * 条件释放锁定库存。
+     */
+    int releaseSkuStock(@Param("skuId") Long skuId, @Param("quantity") Integer quantity);
+
+    /**
+     * 仅当订单仍为待付款时更新为已支付，返回 0 表示已被处理或已取消。
+     */
+    int updateOrderPaySuccess(@Param("orderId") Long orderId, @Param("payType") Integer payType);
+
+    /**
+     * 仅当订单仍为待付款时取消，返回 0 表示已被处理。
+     */
+    int cancelOrderIfPending(@Param("orderId") Long orderId);
+
 }

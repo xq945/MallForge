@@ -9,6 +9,7 @@ import com.macro.mall.common.service.RedisService;
 import com.macro.mall.mapper.*;
 import com.macro.mall.model.*;
 import com.macro.mall.portal.component.CancelOrderSender;
+import com.macro.mall.portal.component.StockLockSender;
 import com.macro.mall.portal.dao.PortalOrderDao;
 import com.macro.mall.portal.dao.PortalOrderItemDao;
 import com.macro.mall.portal.dao.SmsCouponHistoryDao;
@@ -16,12 +17,16 @@ import com.macro.mall.portal.domain.*;
 import com.macro.mall.portal.service.*;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 import org.springframework.util.CollectionUtils;
 
 import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.text.SimpleDateFormat;
+import java.time.Duration;
 import java.util.*;
 import java.util.stream.Collectors;
 
@@ -65,6 +70,14 @@ public class OmsPortalOrderServiceImpl implements OmsPortalOrderService {
     private OmsOrderItemMapper orderItemMapper;
     @Autowired
     private CancelOrderSender cancelOrderSender;
+    @Autowired
+    private StockRedisService stockRedisService;
+    @Autowired
+    private StockLedgerService stockLedgerService;
+    @Autowired
+    private StockLockSender stockLockSender;
+    @Autowired
+    private StringRedisTemplate stringRedisTemplate;
 
     @Override
     public ConfirmOrderResult generateConfirmOrder(List<Long> cartIds) {
@@ -99,6 +112,16 @@ public class OmsPortalOrderServiceImpl implements OmsPortalOrderService {
         }
         //获取购物车及优惠信息
         UmsMember currentMember = memberService.getCurrentMember();
+        //同一 requestId 只允许成功提交一次
+        String idempotentKey = buildIdempotentKey(currentMember.getId(), orderParam.getRequestId());
+        if (idempotentKey != null) {
+            Boolean first = stringRedisTemplate.opsForValue()
+                    .setIfAbsent(idempotentKey, "1", Duration.ofMinutes(30));
+            if (!Boolean.TRUE.equals(first)) {
+                Asserts.fail("请勿重复提交订单");
+            }
+            registerIdempotentCleanup(idempotentKey);
+        }
         List<CartPromotionItem> cartPromotionItemList = cartItemService.listPromotion(currentMember.getId(), orderParam.getCartIds());
         for (CartPromotionItem cartPromotionItem : cartPromotionItemList) {
             //生成下单商品信息
@@ -161,8 +184,12 @@ public class OmsPortalOrderServiceImpl implements OmsPortalOrderService {
         }
         //计算order_item的实付金额
         handleRealAmount(orderItemList);
-        //进行库存锁定
-        lockStock(cartPromotionItemList);
+        //Redis 原子预扣可售库存，失败会回滚本次已扣部分
+        List<StockItem> stockItems = cartToStockItems(cartPromotionItemList);
+        if (!stockRedisService.tryDeduct(stockItems)) {
+            Asserts.fail("库存不足，无法下单");
+        }
+        registerStockRollback(stockItems);
         //根据商品合计、运费、活动优惠、优惠券、积分计算应付金额
         OmsOrder order = new OmsOrder();
         order.setDiscountAmount(new BigDecimal(0));
@@ -189,7 +216,7 @@ public class OmsPortalOrderServiceImpl implements OmsPortalOrderService {
         order.setCreateTime(new Date());
         order.setMemberUsername(currentMember.getUsername());
         //支付方式：0->未支付；1->支付宝；2->微信
-        order.setPayType(orderParam.getPayType());
+        order.setPayType(orderParam.getPayType() == null ? 0 : orderParam.getPayType());
         //订单来源：0->PC订单；1->app订单
         order.setSourceType(1);
         //订单状态：0->待付款；1->待发货；2->已发货；3->已完成；4->已关闭；5->无效订单
@@ -227,6 +254,9 @@ public class OmsPortalOrderServiceImpl implements OmsPortalOrderService {
             orderItem.setOrderSn(order.getOrderSn());
         }
         orderItemDao.insertList(orderItemList);
+        //写入 LOCK 流水，并在事务提交后异步落库
+        stockLedgerService.recordLockPending(order, orderItemList);
+        registerStockLockSend(order, orderItemList);
         //如使用优惠券更新优惠券使用状态
         if (orderParam.getCouponId() != null) {
             updateCouponStatus(orderParam.getCouponId(), currentMember.getId(), 1);
@@ -251,75 +281,70 @@ public class OmsPortalOrderServiceImpl implements OmsPortalOrderService {
 
     @Override
     public Integer paySuccess(Long orderId, Integer payType) {
-        //修改订单支付状态
-        OmsOrder order = new OmsOrder();
-        order.setId(orderId);
-        order.setStatus(1);
-        order.setPaymentTime(new Date());
-        order.setPayType(payType);
-        orderMapper.updateByPrimaryKeySelective(order);
-        //恢复所有下单商品的锁定库存，扣减真实库存
+        //条件更新：只有待付款订单才能变成已支付，重复回调直接返回
+        int updated = portalOrderDao.updateOrderPaySuccess(orderId, payType);
+        if (updated == 0) {
+            return 0;
+        }
         OmsOrderDetail orderDetail = portalOrderDao.getDetail(orderId);
-        int count = portalOrderDao.updateSkuStock(orderDetail.getOrderItemList());
-        return count;
+        if (orderDetail == null || CollectionUtils.isEmpty(orderDetail.getOrderItemList())) {
+            throw new IllegalStateException("订单明细不存在 orderId=" + orderId);
+        }
+        //支付前确保 LOCK 已落库（异步消费可能尚未执行）
+        List<StockItem> items = orderItemsToStockItems(orderDetail.getOrderItemList());
+        stockLedgerService.applyLock(orderDetail.getOrderSn(), items);
+        //写 PAY 流水并扣减 stock/lock_stock/sale，幂等
+        stockLedgerService.applyPay(orderDetail);
+        return 1;
     }
 
     @Override
     public Integer cancelTimeOutOrder() {
-        Integer count=0;
+        Integer count = 0;
         OmsOrderSetting orderSetting = orderSettingMapper.selectByPrimaryKey(1L);
         //查询超时、未支付的订单及订单详情
         List<OmsOrderDetail> timeOutOrders = portalOrderDao.getTimeOutOrders(orderSetting.getNormalOrderOvertime());
         if (CollectionUtils.isEmpty(timeOutOrders)) {
             return count;
         }
-        //修改订单状态为交易取消
-        List<Long> ids = new ArrayList<>();
-        for (OmsOrderDetail timeOutOrder : timeOutOrders) {
-            ids.add(timeOutOrder.getId());
+        // LEFT JOIN 会返回同一订单的多行，按订单去重后逐单条件取消
+        Set<Long> orderIds = timeOutOrders.stream()
+                .map(OmsOrderDetail::getId)
+                .collect(Collectors.toCollection(LinkedHashSet::new));
+        for (Long orderId : orderIds) {
+            cancelOrderInternal(orderId);
+            count++;
         }
-        portalOrderDao.updateOrderStatus(ids, 4);
-        for (OmsOrderDetail timeOutOrder : timeOutOrders) {
-            //解除订单商品库存锁定
-            portalOrderDao.releaseSkuStockLock(timeOutOrder.getOrderItemList());
-            //修改优惠券使用状态
-            updateCouponStatus(timeOutOrder.getCouponId(), timeOutOrder.getMemberId(), 0);
-            //返还使用积分
-            if (timeOutOrder.getUseIntegration() != null) {
-                UmsMember member = memberService.getById(timeOutOrder.getMemberId());
-                memberService.updateIntegration(timeOutOrder.getMemberId(), member.getIntegration() + timeOutOrder.getUseIntegration());
-            }
-        }
-        return timeOutOrders.size();
+        return count;
     }
 
     @Override
     public void cancelOrder(Long orderId) {
-        //查询未付款的取消订单
-        OmsOrderExample example = new OmsOrderExample();
-        example.createCriteria().andIdEqualTo(orderId).andStatusEqualTo(0).andDeleteStatusEqualTo(0);
-        List<OmsOrder> cancelOrderList = orderMapper.selectByExample(example);
-        if (CollectionUtils.isEmpty(cancelOrderList)) {
+        cancelOrderInternal(orderId);
+    }
+
+    /**
+     * 取消订单：条件更新订单状态，只有成功把 0 改成 4 的请求才处理库存与优惠。
+     */
+    private void cancelOrderInternal(Long orderId) {
+        int updated = portalOrderDao.cancelOrderIfPending(orderId);
+        if (updated == 0) {
             return;
         }
-        OmsOrder cancelOrder = cancelOrderList.get(0);
+        OmsOrder cancelOrder = orderMapper.selectByPrimaryKey(orderId);
+        OmsOrderDetail orderDetail = portalOrderDao.getDetail(orderId);
+        if (orderDetail != null) {
+            //确保 LOCK 已落库，然后写 RELEASE 流水并释放 DB/Redis 库存
+            stockLedgerService.applyRelease(orderDetail);
+        }
         if (cancelOrder != null) {
-            //修改订单状态为取消
-            cancelOrder.setStatus(4);
-            orderMapper.updateByPrimaryKeySelective(cancelOrder);
-            OmsOrderItemExample orderItemExample = new OmsOrderItemExample();
-            orderItemExample.createCriteria().andOrderIdEqualTo(orderId);
-            List<OmsOrderItem> orderItemList = orderItemMapper.selectByExample(orderItemExample);
-            //解除订单商品库存锁定
-            if (!CollectionUtils.isEmpty(orderItemList)) {
-                portalOrderDao.releaseSkuStockLock(orderItemList);
-            }
             //修改优惠券使用状态
             updateCouponStatus(cancelOrder.getCouponId(), cancelOrder.getMemberId(), 0);
             //返还使用积分
             if (cancelOrder.getUseIntegration() != null) {
                 UmsMember member = memberService.getById(cancelOrder.getMemberId());
-                memberService.updateIntegration(cancelOrder.getMemberId(), member.getIntegration() + cancelOrder.getUseIntegration());
+                memberService.updateIntegration(cancelOrder.getMemberId(),
+                        member.getIntegration() + cancelOrder.getUseIntegration());
             }
         }
     }
@@ -722,14 +747,91 @@ public class OmsPortalOrderServiceImpl implements OmsPortalOrderService {
     }
 
     /**
-     * 锁定下单商品的所有库存
+     * 同一会员 + requestId 只允许成功提交一次。
      */
-    private void lockStock(List<CartPromotionItem> cartPromotionItemList) {
-        for (CartPromotionItem cartPromotionItem : cartPromotionItemList) {
-            PmsSkuStock skuStock = skuStockMapper.selectByPrimaryKey(cartPromotionItem.getProductSkuId());
-            skuStock.setLockStock(skuStock.getLockStock() + cartPromotionItem.getQuantity());
-            skuStockMapper.updateByPrimaryKeySelective(skuStock);
+    private String buildIdempotentKey(Long memberId, String requestId) {
+        if (requestId == null || requestId.trim().isEmpty()) {
+            return null;
         }
+        return REDIS_DATABASE + ":stock:submit:" + memberId + ":" + requestId.trim();
+    }
+
+    /**
+     * 事务回滚时删除幂等键，允许用户重新提交。
+     */
+    private void registerIdempotentCleanup(String idempotentKey) {
+        if (!TransactionSynchronizationManager.isSynchronizationActive()) {
+            return;
+        }
+        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+            @Override
+            public void afterCompletion(int status) {
+                if (status != TransactionSynchronization.STATUS_COMMITTED) {
+                    stringRedisTemplate.delete(idempotentKey);
+                }
+            }
+        });
+    }
+
+    /**
+     * 事务回滚时释放已预扣的 Redis 库存。
+     */
+    private void registerStockRollback(List<StockItem> stockItems) {
+        if (!TransactionSynchronizationManager.isSynchronizationActive()) {
+            return;
+        }
+        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+            @Override
+            public void afterCompletion(int status) {
+                if (status != TransactionSynchronization.STATUS_COMMITTED) {
+                    stockRedisService.release(stockItems);
+                }
+            }
+        });
+    }
+
+    /**
+     * 事务提交后再发 MQ，避免订单回滚但消息已经发出。
+     */
+    private void registerStockLockSend(OmsOrder order, List<OmsOrderItem> orderItems) {
+        if (!TransactionSynchronizationManager.isSynchronizationActive()) {
+            sendStockLock(order, orderItems);
+            return;
+        }
+        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+            @Override
+            public void afterCommit() {
+                sendStockLock(order, orderItems);
+            }
+        });
+    }
+
+    private void sendStockLock(OmsOrder order, List<OmsOrderItem> orderItems) {
+        StockLockMessage message = new StockLockMessage();
+        message.setOrderId(order.getId());
+        message.setOrderSn(order.getOrderSn());
+        message.setMemberId(order.getMemberId());
+        message.setItems(orderItemsToStockItems(orderItems));
+        stockLockSender.send(message);
+    }
+
+    private List<StockItem> cartToStockItems(List<CartPromotionItem> cartItems) {
+        Map<Long, Integer> quantities = new HashMap<>();
+        for (CartPromotionItem item : cartItems) {
+            quantities.merge(item.getProductSkuId(), item.getQuantity(), Integer::sum);
+        }
+        return quantities.entrySet().stream()
+                .map(entry -> new StockItem(entry.getKey(), entry.getValue()))
+                .sorted(Comparator.comparing(StockItem::getSkuId))
+                .collect(Collectors.toList());
+    }
+
+    private List<StockItem> orderItemsToStockItems(List<OmsOrderItem> orderItems) {
+        List<StockItem> items = new ArrayList<>();
+        for (OmsOrderItem item : orderItems) {
+            items.add(new StockItem(item.getProductSkuId(), item.getProductQuantity()));
+        }
+        return items;
     }
 
     /**

@@ -129,6 +129,17 @@ curl -s -X POST "http://localhost:8201/mall-admin/admin/login" \
 - **密钥为示例值**：数据库密码、RabbitMQ 账号、OSS/MinIO 密钥均为本地示例，部署到真实环境前务必替换；含敏感信息的本地配置请放在 `*.local.yaml`（已 gitignore）。
 - **端口冲突**：mall-admin 用 8080、mall-search 用 8081，被占用时修改 `server.port` 并同步前端代理配置。
 
+## 库存一致性改造
+
+针对下单 `lockStock` 读-改-写导致的并发超卖，本仓库在其基础上完成：
+
+- Redis + Lua 原子预扣可售库存，任一 SKU 不足时回滚本次已扣部分；
+- RabbitMQ 异步落库，消息在订单事务提交后发送；
+- `oms_stock_log` 流水唯一键保证重复消费幂等，支付/取消改为条件更新；
+- 定时对账，以 MySQL 可售库存校正 Redis。
+
+压测方法与 2026-10-22 的实测结果见 [docs/stress-test-plan.md](docs/stress-test-plan.md)。
+
 ## 许可
 
 代码版权归原作者所有，遵循 [Apache License 2.0](LICENSE)。

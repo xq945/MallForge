@@ -23,4 +23,6 @@ public class OrderParam {
     private Integer payType;
     @Schema(title = "被选中的购物车商品ID")
     private List<Long> cartIds;
+    @Schema(title = "幂等请求ID，同一次提交应保持不变")
+    private String requestId;
 }

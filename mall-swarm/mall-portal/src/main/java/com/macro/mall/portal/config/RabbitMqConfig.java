@@ -76,4 +76,34 @@ public class RabbitMqConfig {
                 .with(QueueEnum.QUEUE_TTL_ORDER_CANCEL.getRouteKey());
     }
 
+    /**
+     * 库存锁定落库交换机
+     */
+    @Bean
+    DirectExchange stockLockDirect() {
+        return (DirectExchange) ExchangeBuilder
+                .directExchange(QueueEnum.QUEUE_STOCK_LOCK.getExchange())
+                .durable(true)
+                .build();
+    }
+
+    /**
+     * 库存锁定落库队列
+     */
+    @Bean
+    public Queue stockLockQueue() {
+        return new Queue(QueueEnum.QUEUE_STOCK_LOCK.getName());
+    }
+
+    /**
+     * 库存锁定队列绑定
+     */
+    @Bean
+    Binding stockLockBinding(DirectExchange stockLockDirect, Queue stockLockQueue) {
+        return BindingBuilder
+                .bind(stockLockQueue)
+                .to(stockLockDirect)
+                .with(QueueEnum.QUEUE_STOCK_LOCK.getRouteKey());
+    }
+
 }

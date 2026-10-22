@@ -15,7 +15,7 @@
         </foreach>
     </insert>
     <insert id="replaceList">
-        REPLACE INTO pms_sku_stock (id,product_id, sku_code, price, stock, low_stock,pic, sale, sp_data) VALUES
+        INSERT INTO pms_sku_stock (id, product_id, sku_code, price, stock, low_stock, pic, sale, sp_data) VALUES
         <foreach collection="list" item="item" index="index" separator=",">
             (#{item.id,jdbcType=BIGINT},
             #{item.productId,jdbcType=BIGINT},
@@ -27,5 +27,14 @@
             #{item.sale,jdbcType=INTEGER},
             #{item.spData,jdbcType=VARCHAR})
         </foreach>
+        ON DUPLICATE KEY UPDATE
+            product_id = VALUES(product_id),
+            sku_code = VALUES(sku_code),
+            price = VALUES(price),
+            stock = VALUES(stock),
+            low_stock = VALUES(low_stock),
+            pic = VALUES(pic),
+            sale = VALUES(sale),
+            sp_data = VALUES(sp_data)
     </insert>
 </mapper>
