@@ -131,4 +131,4 @@ curl -s -X POST "http://localhost:8201/mall-admin/admin/login" \
 
 ## 许可
 
-代码版权归原作者所有，遵循 [Apache License 2.0](mall-swarm/LICENSE)。
+代码版权归原作者所有，遵循 [Apache License 2.0](LICENSE)。
