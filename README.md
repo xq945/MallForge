@@ -1,6 +1,8 @@
-# mall-swarm-suite
+# MallForge
 
-mall 电商系统全家桶，把后端微服务与两套前端整合在同一个仓库里，便于统一阅读、构建和联调。
+> MallForge 是基于 [macrozheng/mall-swarm](https://github.com/macrozheng/mall-swarm) 系列上游项目整合的二次开发版本，代码版权归原作者所有，遵循 Apache License 2.0。上游版本信息见下方「版本基线」。
+
+MallForge 是一个电商系统全家桶，把后端微服务与两套前端整合在同一个仓库里，便于统一阅读、构建和联调。
 
 ## 仓库结构
 
