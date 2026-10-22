@@ -15,6 +15,8 @@ import com.macro.mall.portal.dao.PortalOrderItemDao;
 import com.macro.mall.portal.dao.SmsCouponHistoryDao;
 import com.macro.mall.portal.domain.*;
 import com.macro.mall.portal.service.*;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.data.redis.core.StringRedisTemplate;
@@ -36,6 +38,7 @@ import java.util.stream.Collectors;
  */
 @Service
 public class OmsPortalOrderServiceImpl implements OmsPortalOrderService {
+    private static final Logger LOGGER = LoggerFactory.getLogger(OmsPortalOrderServiceImpl.class);
     @Autowired
     private UmsMemberService memberService;
     @Autowired
@@ -271,8 +274,8 @@ public class OmsPortalOrderServiceImpl implements OmsPortalOrderService {
         }
         //删除购物车中的下单商品
         deleteCartItemList(cartPromotionItemList, currentMember);
-        //发送延迟消息取消订单
-        sendDelayMessageCancelOrder(order.getId());
+        //事务提交后再发延迟取消消息，发送失败由超时扫描任务兜底
+        registerDelayCancelSend(order.getId());
         Map<String, Object> result = new HashMap<>();
         result.put("order", order);
         result.put("orderItemList", orderItemList);
@@ -323,6 +326,21 @@ public class OmsPortalOrderServiceImpl implements OmsPortalOrderService {
         cancelOrderInternal(orderId);
     }
 
+    @Override
+    public List<Long> listTimeOutOrderIds(Integer minutes) {
+        return portalOrderDao.getTimeOutOrderIds(minutes);
+    }
+
+    @Override
+    public List<Long> listAutoConfirmOrderIds() {
+        return portalOrderDao.getAutoConfirmOrderIds();
+    }
+
+    @Override
+    public boolean autoConfirmOrder(Long orderId) {
+        return portalOrderDao.autoConfirmOrder(orderId) > 0;
+    }
+
     /**
      * 取消订单：条件更新订单状态，只有成功把 0 改成 4 的请求才处理库存与优惠。
      */
@@ -362,16 +380,17 @@ public class OmsPortalOrderServiceImpl implements OmsPortalOrderService {
     public void confirmReceiveOrder(Long orderId) {
         UmsMember member = memberService.getCurrentMember();
         OmsOrder order = orderMapper.selectByPrimaryKey(orderId);
-        if(!member.getId().equals(order.getMemberId())){
+        if (order == null || !member.getId().equals(order.getMemberId())) {
             Asserts.fail("不能确认他人订单！");
         }
-        if(order.getStatus()!=2){
+        if (order.getStatus() != 2) {
             Asserts.fail("该订单还未发货！");
         }
-        order.setStatus(3);
-        order.setConfirmStatus(1);
-        order.setReceiveTime(new Date());
-        orderMapper.updateByPrimaryKey(order);
+        //条件更新：避免与自动收货任务并发时重复确认
+        int updated = portalOrderDao.confirmReceiveOrder(orderId, member.getId());
+        if (updated == 0) {
+            Asserts.fail("订单状态已变更，请刷新后重试");
+        }
     }
 
     @Override
@@ -804,6 +823,31 @@ public class OmsPortalOrderServiceImpl implements OmsPortalOrderService {
                 sendStockLock(order, orderItems);
             }
         });
+    }
+
+    /**
+     * 事务提交后发送延迟取消消息，避免订单回滚后仍然发出取消消息。
+     */
+    private void registerDelayCancelSend(Long orderId) {
+        if (!TransactionSynchronizationManager.isSynchronizationActive()) {
+            safeSendDelayCancel(orderId);
+            return;
+        }
+        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+            @Override
+            public void afterCommit() {
+                safeSendDelayCancel(orderId);
+            }
+        });
+    }
+
+    private void safeSendDelayCancel(Long orderId) {
+        try {
+            sendDelayMessageCancelOrder(orderId);
+        } catch (Exception e) {
+            // 发送失败不阻断下单，超时扫描任务会兜底关闭订单
+            LOGGER.error("send delay cancel message failed orderId={}", orderId, e);
+        }
     }
 
     private void sendStockLock(OmsOrder order, List<OmsOrderItem> orderItems) {

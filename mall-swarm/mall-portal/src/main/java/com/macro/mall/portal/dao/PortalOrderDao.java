@@ -62,4 +62,24 @@ public interface PortalOrderDao {
      */
     int cancelOrderIfPending(@Param("orderId") Long orderId);
 
+    /**
+     * 查询超时未支付订单 ID，供定时任务逐单取消。
+     */
+    List<Long> getTimeOutOrderIds(@Param("minute") Integer minute);
+
+    /**
+     * 查询已发货且超过自动收货天数的订单 ID。
+     */
+    List<Long> getAutoConfirmOrderIds();
+
+    /**
+     * 用户确认收货：条件更新，返回 0 表示状态已变更。
+     */
+    int confirmReceiveOrder(@Param("orderId") Long orderId, @Param("memberId") Long memberId);
+
+    /**
+     * 自动确认收货：条件更新，返回 0 表示状态已变更。
+     */
+    int autoConfirmOrder(@Param("orderId") Long orderId);
+
 }

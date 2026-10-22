@@ -128,4 +128,45 @@
           AND status = 0
           AND delete_status = 0
     </update>
+
+    <select id="getTimeOutOrderIds" resultType="java.lang.Long">
+        SELECT id
+        FROM oms_order
+        WHERE status = 0
+          AND delete_status = 0
+          AND create_time &lt; DATE_SUB(NOW(), INTERVAL #{minute} MINUTE)
+        ORDER BY id
+        LIMIT 500
+    </select>
+
+    <select id="getAutoConfirmOrderIds" resultType="java.lang.Long">
+        SELECT id
+        FROM oms_order
+        WHERE status = 2
+          AND confirm_status = 0
+          AND delete_status = 0
+          AND delivery_time IS NOT NULL
+          AND DATE_ADD(delivery_time, INTERVAL auto_confirm_day DAY) &lt;= NOW()
+        ORDER BY id
+        LIMIT 500
+    </select>
+
+    <update id="confirmReceiveOrder">
+        UPDATE oms_order
+        SET status = 3, confirm_status = 1, receive_time = NOW()
+        WHERE id = #{orderId}
+          AND member_id = #{memberId}
+          AND status = 2
+          AND confirm_status = 0
+          AND delete_status = 0
+    </update>
+
+    <update id="autoConfirmOrder">
+        UPDATE oms_order
+        SET status = 3, confirm_status = 1, receive_time = NOW()
+        WHERE id = #{orderId}
+          AND status = 2
+          AND confirm_status = 0
+          AND delete_status = 0
+    </update>
 </mapper>

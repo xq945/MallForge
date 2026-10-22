@@ -38,6 +38,22 @@ public interface OmsPortalOrderService {
     Integer cancelTimeOutOrder();
 
     /**
+     * 查询超时未支付订单 ID，供定时任务逐单取消。
+     */
+    List<Long> listTimeOutOrderIds(Integer minutes);
+
+    /**
+     * 查询已发货且达到自动收货时间的订单 ID。
+     */
+    List<Long> listAutoConfirmOrderIds();
+
+    /**
+     * 自动确认收货，返回是否更新成功。
+     */
+    @Transactional
+    boolean autoConfirmOrder(Long orderId);
+
+    /**
      * 取消单个超时订单
      */
     @Transactional

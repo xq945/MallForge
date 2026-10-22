@@ -140,6 +140,16 @@ curl -s -X POST "http://localhost:8201/mall-admin/admin/login" \
 
 压测方法与 2026-10-22 的实测结果见 [docs/stress-test-plan.md](docs/stress-test-plan.md)。
 
+## 订单生命周期
+
+库存一致性解决「下单锁库存」后，补齐了取消与收货链路：
+
+- 延迟取消消息改为订单事务提交后发送，发送失败由超时扫描兜底；
+- 每分钟扫描超时未支付订单，Redis 分布式锁 + 逐单事务，单笔失败不影响其他订单；
+- 每 5 分钟自动确认收货，确认收货改为条件更新，避免与用户手动确认并发重复更新。
+
+实现与验证记录见 [docs/order-lifecycle.md](docs/order-lifecycle.md)。
+
 ## 许可
 
 代码版权归原作者所有，遵循 [Apache License 2.0](LICENSE)。
